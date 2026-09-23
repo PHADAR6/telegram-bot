@@ -410,13 +410,19 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
 
 // ── Display helpers (shared by formatting and the CLI) ───────────────────────
 
-/** Atomic USDC -> a trimmed decimal string. `20000000n` -> `"2"`. */
+/**
+ * Atomic USDC -> an explicit 7-decimal string.
+ *
+ * Soroban amounts are integer atomic units, so keeping all seven fractional
+ * digits makes the display unit unambiguous (`20000000n` -> `"2.0000000"`)
+ * without ever converting through a floating-point number.
+ */
 export function formatUsdc(units: bigint): string {
   const negative = units < 0n;
   const abs = negative ? -units : units;
   const whole = abs / USDC_UNIT;
-  const frac = (abs % USDC_UNIT).toString().padStart(7, "0").replace(/0+$/, "");
-  return `${negative ? "-" : ""}${whole}${frac ? `.${frac}` : ""}`;
+  const frac = (abs % USDC_UNIT).toString().padStart(7, "0");
+  return `${negative ? "-" : ""}${whole}.${frac}`;
 }
 
 /** `GABCD…WXYZ` — full strkeys are unreadable in a chat message. */
