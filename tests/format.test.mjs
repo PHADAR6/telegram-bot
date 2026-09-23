@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { createNotifier } from "../dist/bot.js";
 import { escapeMd, formatEvent } from "../dist/notifications/format.js";
+import { formatUsdc } from "../dist/stellar/decode.js";
 
 const reserved = "_*[]()~`>#+-=|{}.\\!";
 const reservedSet = new Set(Array.from(reserved));
@@ -20,6 +21,73 @@ function seededRandom(seed) {
     return state / 0x1_0000_0000;
   };
 }
+
+test("formatUsdc always renders all seven Stellar USDC decimals", () => {
+  const cases = [
+    [0n, "0.0000000"],
+    [1n, "0.0000001"],
+    [10_000_000n, "1.0000000"],
+    [20_000_000n, "2.0000000"],
+    [12_345_678n, "1.2345678"],
+    [-1n, "-0.0000001"],
+    [-12_345_678n, "-1.2345678"],
+    [123_456_789_012_345_678_901_234_567n, "12345678901234567890.1234567"],
+  ];
+
+  for (const [units, expected] of cases) {
+    assert.equal(formatUsdc(units), expected, String(units));
+  }
+});
+
+test("formatted money notifications keep explicit decimals and escape the decimal point", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 43,
+    txHash: "",
+    at: 0,
+    eventId: "43-0",
+    payload: {
+      name: "claim_challenged",
+      claimId: 7,
+      challenger: "GABCD",
+      stake: 20_000_000n,
+    },
+  };
+
+  const message = formatEvent(config, event);
+  assert.match(message, /Stake: \*2\\\.0000000 USDC\*/);
+});
+
+test("unknown or malformed decoded events stay non-notifying", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 44,
+    txHash: "",
+    at: 0,
+    eventId: "44-0",
+    payload: { name: "unknown", eventName: "claim_challenged", reason: "malformed amount" },
+  };
+
+  assert.equal(formatEvent(config, event), null);
+});
 
 test("escapeMd escapes every MarkdownV2 reserved character exactly once", () => {
   assert.equal(escapeMd(reserved), expectedEscape(reserved));

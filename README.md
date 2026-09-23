@@ -11,7 +11,7 @@ Creator: GBMGZ…IR2Y
 ledger 4226691 · tx
 
 ⚔️ Claim #7 challenged
-Stake: 2 USDC
+Stake: 2.0000000 USDC
 Challenger: GDZCB…X4UH
 ledger 4226692 · tx
 
