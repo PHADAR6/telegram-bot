@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Environment loading and validation.
  *
  * Fails fast and LOUDLY: a notifier that boots with a missing chat id or a
@@ -11,7 +11,7 @@
  *     reader (`src/stellar/events.ts`) can be run standalone against Testnet.
  *   - {@link loadConfig} is the full bot config.
  *
- * ── Profiles ─────────────────────────────────────────────────────────────────
+ * â”€â”€ Profiles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * `MIMIR_PROFILE=mock` selects the local Soroban mock profile: it supplies
  * defaults for values the environment does NOT set (loopback RPC, fixture
@@ -30,7 +30,9 @@
  * value the machine provided from one the file provided.
  */
 
+import { createRequire } from "node:module";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 import { config as loadDotenv, type DotenvConfigOptions } from "dotenv";
 
@@ -110,9 +112,34 @@ function loadEnvFile(): EnvFileState {
   }
 }
 
+/**
+ * Package version read once at startup from `package.json`. Surfaced in the
+ * health report, `/status`, boot logs, and log exports so operators can
+ * confirm which release is running without a shell session on the host.
+ *
+ * Falls back to `"unknown"` when the field is absent or the file cannot be
+ * loaded (e.g. a custom build that strips the manifest).
+ */
+export const APP_VERSION: string = (() => {
+  try {
+    // createRequire is the idiomatic way to load JSON in ESM without enabling
+    // resolveJsonModule (which would require declaration file emission).
+    const req = createRequire(import.meta.url);
+    const pkg = req("../package.json") as { version?: unknown };
+    const v = pkg.version;
+    return typeof v === "string" && v.length > 0 ? v : "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
 export interface StellarConfig {
+  /** Named network, derived from STELLAR_NETWORK or inferred from the passphrase. */
+  network?: StellarNetwork;
   marketContractId: string;
   squadContractId: string;
+  marketContractVersion: string;
+  squadContractVersion: string;
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
@@ -120,7 +147,14 @@ export interface StellarConfig {
   explorerBaseUrl: string;
 }
 
+export interface TelegramRoute {
+  chatId: string;
+  channelPreviewMode: boolean;
+}
+
 export interface BotConfig extends StellarConfig {
+  /** Semver string from `package.json`, or `"unknown"` if unavailable. */
+  version: string;
   botToken: string;
   chatId: string;
   /** Optional per-contract destinations; absent values use `chatId`. */
@@ -137,6 +171,8 @@ export interface BotConfig extends StellarConfig {
   lockFile: string;
   statusFile: string;
   maxNotificationsPerCycle: number;
+  /** Path for the standalone scanner's CSV output (see CSV_OUTPUT_FILE). */
+  csvOutputFile: string;
   /** Coarse notification feature flags (see NOTIFY_* env vars). */
   featureFlags: NotificationFeatureFlags;
   /** Append-only JSONL audit trail (see src/audit.ts). Empty disables it. */
@@ -146,6 +182,15 @@ export interface BotConfig extends StellarConfig {
    * across overlapping pages, resumed cursors, and restarts. `0` disables it.
    */
   dedupWindow: number;
+  /**
+   * Bounded on-disk queue for sends that exhausted their in-cycle
+   * retries. Empty disables the queue (see src/deadLetter.ts).
+   */
+  deadLetterFile: string;
+  /** Parked sends retained; the oldest is dropped once the queue is full. */
+  deadLetterMax: number;
+  /** Replay attempts before a parked send is dropped as poison. */
+  deadLetterMaxAttempts: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -170,12 +215,19 @@ export interface BotConfig extends StellarConfig {
    * cursor state and giving up on it. `0` skips the wait entirely.
    */
   shutdownTimeoutMs: number;
+  /** Wall-clock budget for a single Telegram send before it is abandoned. */
+  telegramSendTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /** Per-chat notification preferences. */
+  routes: TelegramRoute[];
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
+export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -192,9 +244,10 @@ export class ConfigError extends Error {
 }
 
 const DEFAULTS = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  horizonUrl: "https://horizon-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
+  network: "testnet" as StellarNetwork,
+  rpcUrl: NETWORK_RPC_URLS.testnet,
+  horizonUrl: NETWORK_HORIZON_URLS.testnet,
+  networkPassphrase: NETWORK_PASSPHRASES.testnet,
   pollIntervalMs: 30_000,
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
@@ -202,11 +255,15 @@ const DEFAULTS = {
   lockFile: "./data/poller.lock",
   statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
+  csvOutputFile: "./data/scanner_output.csv",
   auditFile: "./data/audit.jsonl",
   dedupWindow: 256,
+  deadLetterFile: "./data/dead-letter.json",
+  deadLetterMax: 100,
+  deadLetterMaxAttempts: 10,
   healthHost: "127.0.0.1",
   healthPort: 8787,
-  // 3× default poll interval — one missed cycle is fine; three is not.
+  // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
   // Retry RPC getHealth at boot for up to 30s (Testnet blips / deploy races).
   startupHealthDeadlineMs: 30_000,
@@ -214,7 +271,15 @@ const DEFAULTS = {
   // Long enough for an in-flight read to finish and its cursors to land, short
   // enough that a deploy is never held open by a wedged RPC.
   shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  // Bounded so one wedged Telegram send cannot stall the poll loop; long
+  // enough for a normal API round-trip on a slow link.
+  telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
   channelPreviewMode: false,
+  logSampleMaxPerWindow: 3,
+  // ~10 default poll cycles of a down RPC, collapsed into one line plus a
+  // summary. Long enough not to hide a flapping error, short enough to bound
+  // an outage that lasts for hours.
+  logSampleWindowMs: 300_000,
 } as const;
 
 /**
@@ -238,6 +303,7 @@ const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
  */
 const PROFILE_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   [MOCK_PROFILE_NAME]: {
+    STELLAR_NETWORK: "custom",
     MARKET_CONTRACT_ID: MOCK_MARKET_CONTRACT_ID,
     SQUAD_CONTRACT_ID: MOCK_SQUAD_CONTRACT_ID,
     STELLAR_RPC_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}`,
@@ -298,14 +364,39 @@ function collector(profile: Record<string, string>) {
       const value = this.required(name);
       if (value !== "" && !CONTRACT_ID_RE.test(value)) {
         problems.push(
-          `${name} is not a Soroban contract id (expected C… strkey, 56 chars); got "${value}"`,
+          `${name} is not a Soroban contract id (expected Câ€¦ strkey, 56 chars); got "${value}"`,
         );
       }
       return value;
     },
 
+    contractVersion(name: string, fallback: string): string {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      const trimmed = raw.toLowerCase().trim();
+      if (!/^[a-z0-9_.-]+$/.test(trimmed)) {
+        problems.push(`${name} must be a valid version string (e.g. v1, v2); got "${raw}"`);
+        return fallback;
+      }
+      return trimmed;
+    },
+
     url(name: string, fallback: string): string {
       const value = get(name) ?? fallback;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        }
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+      }
+      return value;
+    },
+
+    optionalUrl(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
       try {
         const parsed = new URL(value);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
@@ -342,18 +433,42 @@ function collector(profile: Record<string, string>) {
       return fallback;
     },
 
-    chatId(name: string): string {
+    chatIds(name: string): string[] {
       const value = this.required(name);
-      // Telegram chat ids are integers (channels/supergroups are negative).
-      // A @channelusername also works for public channels, so both are allowed.
-      if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
+      if (value === "") return [];
+      
+      const ids = value.split(",").map(s => s.trim()).filter(s => s !== "");
+      if (ids.length === 0) {
+        problems.push(`${name} is required but not set`);
+        return [];
       }
-      return value;
+      for (const id of ids) {
+        if (!/^-?\d+$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
+          problems.push(
+            `${name} must contain numeric chat ids or @channelusernames; got "${id}"`,
+          );
+        }
+      }
+      return ids;
     },
 
+    /**
+     * Parse an optional TCP port number. Returns `null` when the env var is
+     * absent/empty (server disabled). Validates 1–65535 when present.
+     */
+    optionalPort(name: string): number | null {
+      const raw = read(name);
+      if (raw === undefined) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        problems.push(`${name} must be an integer port number (1–65535); got "${raw}"`);
+        return null;
+      }
+      if (parsed < 1 || parsed > 65_535) {
+        problems.push(`${name} must be between 1 and 65535; got ${parsed}`);
+        return null;
+      }
+      return parsed;
     optionalChatId(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       if (value === "") return value;
@@ -382,7 +497,7 @@ function collector(profile: Record<string, string>) {
       for (const entry of entries) {
         if (!/^-?\d+$/.test(entry) && !/^@[A-Za-z0-9_]{4,}$/.test(entry)) {
           problems.push(
-            `${name} contains an invalid entry "${entry}" — ` +
+            `${name} contains an invalid entry "${entry}" â€” ` +
               `each value must be a numeric chat id or a @channelusername`,
           );
         }
@@ -403,7 +518,7 @@ function collector(profile: Record<string, string>) {
 
     host(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
-      // Keep this a host, not a URL — the health server binds a TCP listener.
+      // Keep this a host, not a URL â€” the health server binds a TCP listener.
       if (/[\s/]/.test(value) || value.includes("://")) {
         problems.push(
           `${name} must be a hostname or IP (e.g. 127.0.0.1); got "${value}"`,
@@ -411,16 +526,70 @@ function collector(profile: Record<string, string>) {
       }
       return value;
     },
+
+    network(name: string, fallback: StellarNetwork): StellarNetwork {
+      const value = get(name);
+      if (value === undefined) return fallback;
+      const valid: StellarNetwork[] = ["testnet", "mainnet", "futurenet", "custom"];
+      if (!valid.includes(value as StellarNetwork)) {
+        problems.push(
+          `${name} must be one of ${valid.join(", ")}; got "${value}"`,
+        );
+        return fallback;
+      }
+      return value as StellarNetwork;
+    },
   };
 }
 
+function parseNotificationCategories(raw: string | undefined): string[] {
+  const candidates = raw
+    ? raw.split(/[\s,]+/)
+    : [];
+
+  const normalized = [...new Set(
+    candidates
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0),
+  )];
+
+  return normalized;
+}
+
+function notificationCategoriesFrom(): readonly string[] {
+  const envValues = [
+    "NOTIFY_CATEGORIES",
+    "NOTIFICATION_CATEGORIES",
+    "NOTIFY_EVENT_CATEGORIES",
+    "EVENT_CATEGORIES",
+    "CLAIM_CATEGORIES",
+  ]
+    .map((name) => read(name))
+    .filter((value): value is string => value !== undefined && value.trim().length > 0);
+
+  if (envValues.length === 0) return [];
+  return parseNotificationCategories(envValues.join(","));
+}
+
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
+  const network = c.network("STELLAR_NETWORK", DEFAULTS.network);
+  const namedDefaults = network !== "custom" ? {
+    rpcUrl: NETWORK_RPC_URLS[network],
+    horizonUrl: NETWORK_HORIZON_URLS[network],
+    passphrase: NETWORK_PASSPHRASES[network],
+  } : {
+    rpcUrl: DEFAULTS.rpcUrl,
+    horizonUrl: DEFAULTS.horizonUrl,
+    passphrase: DEFAULTS.networkPassphrase,
+  };
+
   return {
+    network,
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
-    rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
-    horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
-    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
+    rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
+    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
       "STELLAR_EXPLORER_BASE_URL",
       "https://stellar.expert/explorer",
@@ -459,6 +628,7 @@ export function loadConfig(): BotConfig {
 
   const config: BotConfig = {
     ...stellar,
+    version: APP_VERSION,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
@@ -475,11 +645,23 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     featureFlags: featureFlagsParsed.flags,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
     auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
     // 0 is the documented escape hatch: no redelivery suppression.
     dedupWindow: c.int("EVENT_DEDUP_WINDOW", DEFAULTS.dedupWindow, 0),
+    // Resolved like the cursor file: relative paths anchor to the cwd.
+    deadLetterFile: path.resolve(
+      process.cwd(),
+      c.get("DEAD_LETTER_FILE") ?? DEFAULTS.deadLetterFile,
+    ),
+    deadLetterMax: c.int("DEAD_LETTER_MAX", DEFAULTS.deadLetterMax, 1),
+    deadLetterMaxAttempts: c.int(
+      "DEAD_LETTER_MAX_ATTEMPTS",
+      DEFAULTS.deadLetterMaxAttempts,
+      1,
+    ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
@@ -496,18 +678,40 @@ export function loadConfig(): BotConfig {
       0,
     ),
     shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
+    telegramSendTimeoutMs: c.int(
+      "TELEGRAM_SEND_TIMEOUT_MS",
+      DEFAULTS.telegramSendTimeoutMs,
+      0,
+    ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    logSampleMaxPerWindow: c.int(
+      "LOG_SAMPLE_MAX_PER_WINDOW",
+      DEFAULTS.logSampleMaxPerWindow,
+      1,
+    ),
+    // A window of 1ms is legal but pointless; 1s is the smallest useful unit.
+    logSampleWindowMs: c.int("LOG_SAMPLE_WINDOW_MS", DEFAULTS.logSampleWindowMs, 1_000),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
   return config;
 }
 
-/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
+/** Display label for the active Stellar network. */
 export function networkLabel(config: StellarConfig): string {
-  if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
-  if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
-  if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
+  const net = config.network ?? inferNetwork(config.networkPassphrase);
+  if (net === "custom") {
+    if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
+    return "custom";
+  }
+  return net;
+}
+
+/** Derive a StellarNetwork from a passphrase when the field is absent (backward compat). */
+function inferNetwork(passphrase: string): StellarNetwork {
+  if (passphrase === NETWORK_PASSPHRASES.mainnet) return "mainnet";
+  if (passphrase === NETWORK_PASSPHRASES.testnet) return "testnet";
+  if (passphrase === NETWORK_PASSPHRASES.futurenet) return "futurenet";
   return "custom";
 }
 
@@ -619,7 +823,10 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
+  { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
+  { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
   { key: "PORT", secret: false },
@@ -776,4 +983,34 @@ export function formatProvenanceSummary(provenance: ConfigProvenance): string {
     `profile=${provenance.profile ?? "none"} env-file=${file} ${counts.join(" ")} ` +
     `secret-keys=${secrets}/${provenance.entries.length}`
   );
+}
+
+/**
+ * Generates a deterministic SBOM-friendly hash of the current configuration.
+ *
+ * This function creates a SHA-256 hash of the non-sensitive configuration
+ * values. It is used to generate Software Bill of Materials (SBOM) metadata
+ * for the bot image, ensuring the read-only Mimir notifier remains reliable,
+ * understandable, and safe during long-running Stellar and Telegram failures.
+ *
+ * Sensitive fields (botToken, chatId) are excluded to prevent leakage.
+ *
+ * @param config - The loaded BotConfig instance.
+ * @returns A hex-encoded SHA-256 hash string representing the configuration state.
+ */
+export function generateConfigHash(config: BotConfig): string {
+  const safeConfig = {
+    marketContractId: config.marketContractId,
+    squadContractId: config.squadContractId,
+    rpcUrl: config.rpcUrl,
+    horizonUrl: config.horizonUrl,
+    networkPassphrase: config.networkPassphrase,
+    pollIntervalMs: config.pollIntervalMs,
+    startLookbackLedgers: config.startLookbackLedgers,
+    cursorFile: config.cursorFile,
+    maxNotificationsPerCycle: config.maxNotificationsPerCycle,
+  };
+
+  const serialized = JSON.stringify(safeConfig, Object.keys(safeConfig).sort());
+  return createHash("sha256").update(serialized).digest("hex");
 }
