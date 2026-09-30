@@ -1,23 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createBot, healthMessage, registerCommands } from "../dist/bot.js";
+import { createBot, registerCommands } from "../dist/bot.js";
 import { buildHealthReport, startHealthServer } from "../dist/health.js";
 
 function baseConfig(overrides = {}) {
   return {
+    version: "0.1.0",
     marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
     squadContractId: "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
     botToken: "0000000000:SECRET-TOKEN-DO-NOT-LEAK",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: null,
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
     cursorFile: "./data/cursor.json",
     maxNotificationsPerCycle: 20,
+    deadLetterFile: "./data/dead-letter.json",
+    deadLetterMax: 100,
+    deadLetterMaxAttempts: 10,
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
@@ -41,6 +45,7 @@ function baseStatus(overrides = {}) {
     notificationsSent: 2,
     notificationsFailed: 0,
     eventsSkipped: 1,
+    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
     consecutiveFailures: 0,
     lastError: null,
     targets: [
@@ -131,7 +136,7 @@ test("buildHealthReport never embeds bot token or chat id", () => {
   const report = buildHealthReport(config, baseStatus(), 5_500);
   const blob = JSON.stringify(report);
   assert.equal(blob.includes(config.botToken), false);
-  assert.equal(blob.includes(config.chatId), false);
+  assert.equal(blob.includes(config.chatIds), false);
   assert.equal(blob.includes("SECRET-TOKEN"), false);
 });
 
@@ -334,7 +339,7 @@ test("createBot /health command replies with exact MarkdownV2 payload for health
     message: {
       message_id: 10,
       date: 1700000000,
-      chat: { id: Number(config.chatId), type: "supergroup" },
+      chat: { id: Number(config.chatIds[0]), type: "supergroup" },
       from: { id: 100, is_bot: false, first_name: "Tester" },
       text: "/health",
       entities: [{ type: "bot_command", offset: 0, length: 7 }],
@@ -344,7 +349,7 @@ test("createBot /health command replies with exact MarkdownV2 payload for health
   await bot.handleUpdate(update);
 
   assert.equal(sent.length, 1);
-  assert.equal(String(sent[0].chat_id), config.chatId);
+  assert.equal(String(sent[0].chat_id), config.chatIds[0]);
   assert.equal(sent[0].parse_mode, "MarkdownV2");
   assert.deepEqual(sent[0].link_preview_options, { is_disabled: true });
 
@@ -398,7 +403,7 @@ test("createBot /health command reflects degraded status on RPC failure", async 
     message: {
       message_id: 11,
       date: 1700000000,
-      chat: { id: Number(config.chatId), type: "supergroup" },
+      chat: { id: Number(config.chatIds[0]), type: "supergroup" },
       from: { id: 100, is_bot: false, first_name: "Tester" },
       text: "/health",
       entities: [{ type: "bot_command", offset: 0, length: 7 }],
@@ -443,7 +448,7 @@ test("createBot /health command reflects stopped status when poller is off", asy
     message: {
       message_id: 12,
       date: 1700000000,
-      chat: { id: Number(config.chatId), type: "supergroup" },
+      chat: { id: Number(config.chatIds[0]), type: "supergroup" },
       from: { id: 100, is_bot: false, first_name: "Tester" },
       text: "/health",
       entities: [{ type: "bot_command", offset: 0, length: 7 }],
@@ -485,4 +490,3 @@ test("registerCommands registers /health command with setMyCommands", async () =
   assert.ok(healthCmd);
   assert.equal(healthCmd.description, "Health assessment and operational readiness");
 });
-
